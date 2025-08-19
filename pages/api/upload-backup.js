@@ -34,68 +34,46 @@ export default async function handler(req, res) {
       return res.status(400).json({ message: "بيانات ناقصة" });
     }
 
-    console.log(`=== بدء معالجة الملف المضغوط للمستودع: ${repo} ===`);
-
     // فك ضغط الملف في مجلد مؤقت
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "upload-"));
-    console.log(`�� تم إنشاء المجلد المؤقت: ${tmpDir}`);
-    
     const zip = new AdmZip(zipBuffer);
     zip.extractAllTo(tmpDir, true);
-    console.log(`📦 تم استخراج الملف المضغوط`);
     
     // التحقق من وجود مجلد واحد فقط في الأعلى (مجلد المشروع)
     const topLevelItems = fs.readdirSync(tmpDir);
-    console.log(`📋 المحتويات في المجلد المؤقت:`, topLevelItems);
-    
     let projectDir = tmpDir;
     
     // إذا كان هناك مجلد واحد فقط في الأعلى، انسخ محتوياته إلى المجلد الجذر
     if (topLevelItems.length === 1 && fs.statSync(path.join(tmpDir, topLevelItems[0])).isDirectory()) {
       const subDir = path.join(tmpDir, topLevelItems[0]);
-      console.log(`🔍 تم اكتشاف مجلد المشروع: ${topLevelItems[0]}`);
-      console.log(`📂 مسار المجلد الفرعي: ${subDir}`);
-      
-      // عرض محتويات المجلد الفرعي
-      const subDirContents = fs.readdirSync(subDir);
-      console.log(`📋 محتويات المجلد الفرعي:`, subDirContents);
+      console.log(`تم اكتشاف مجلد المشروع: ${topLevelItems[0]} - نسخ المحتويات إلى الجذر`);
       
       // نسخ جميع الملفات من المجلد الفرعي إلى المجلد الجذر
       const copyRecursive = (src, dest) => {
         const items = fs.readdirSync(src);
-        console.log(`📄 نسخ ${items.length} عنصر من ${src} إلى ${dest}`);
-        
         items.forEach(item => {
           const srcPath = path.join(src, item);
           const destPath = path.join(dest, item);
           const stat = fs.statSync(srcPath);
           
           if (stat.isDirectory()) {
-            console.log(`📁 إنشاء مجلد: ${destPath}`);
             fs.mkdirSync(destPath, { recursive: true });
             copyRecursive(srcPath, destPath);
           } else {
-            console.log(`📄 نسخ ملف: ${srcPath} → ${destPath}`);
             fs.copyFileSync(srcPath, destPath);
           }
         });
       };
       
       copyRecursive(subDir, tmpDir);
-      
       // حذف المجلد الفرعي الأصلي
-      console.log(`🗑️ حذف المجلد الفرعي الأصلي: ${subDir}`);
       fs.rmSync(subDir, { recursive: true, force: true });
-      
-      // التحقق من المحتويات بعد النسخ
-      const finalContents = fs.readdirSync(tmpDir);
-      console.log(`✅ المحتويات النهائية في المجلد الجذر:`, finalContents);
+      console.log(`تم نسخ المحتويات إلى المجلد الجذر وحذف المجلد الفرعي`);
     } else {
-      console.log(`📂 استخدام المجلد الجذر مباشرة`);
+      console.log(`استخدام المجلد الجذر مباشرة`);
     }
 
     // إنشاء مستودع جديد على GitHub
-    console.log(`🌐 إنشاء مستودع جديد على GitHub: ${repo}`);
     const createRepoRes = await fetch("https://api.github.com/user/repos", {
       method: "POST",
       headers: {
@@ -106,19 +84,14 @@ export default async function handler(req, res) {
       body: JSON.stringify({
         name: repo,
         private: false,
-        auto_init: false, // لا نريد إنشاء README تلقائياً
+        auto_init: true,
       }),
     });
-    
     if (!createRepoRes.ok) {
-      const errorText = await createRepoRes.text();
-      console.error(`❌ فشل إنشاء المستودع:`, errorText);
       return res.status(400).json({ message: "فشل إنشاء المستودع على GitHub" });
     }
-    
     const repoData = await createRepoRes.json();
     const repoUrl = repoData.html_url;
-    console.log(`✅ تم إنشاء المستودع: ${repoUrl}`);
 
     // رفع الملفات إلى المستودع (ملف ملف عبر GitHub API)
     const walk = (dir) => {
@@ -135,14 +108,7 @@ export default async function handler(req, res) {
       });
       return results;
     };
-    
     const files = walk(projectDir);
-    console.log(`📊 تم العثور على ${files.length} ملف للرفع`);
-    console.log(`📁 المجلد الجذر: ${projectDir}`);
-    console.log(`📋 قائمة الملفات:`, files.map(f => path.relative(projectDir, f)));
-
-    let uploadedCount = 0;
-    let failedCount = 0;
 
     for (const filePath of files) {
       const content = fs.readFileSync(filePath, { encoding: "base64" });
@@ -150,18 +116,17 @@ export default async function handler(req, res) {
       
       // تجاهل الملفات المخفية والمجلدات
       if (relPath.startsWith('.') || relPath.includes('/.')) {
-        console.log(`🚫 تجاهل الملف المخفي: ${relPath}`);
         continue;
       }
       
       // تجاهل الملفات الكبيرة جداً (أكبر من 100MB)
       if (content.length > 100 * 1024 * 1024) {
-        console.log(`🚫 تجاهل الملف الكبير: ${relPath}`);
+        console.log(`تجاهل الملف الكبير: ${relPath}`);
         continue;
       }
       
       try {
-        console.log(`⬆️ جاري رفع: ${relPath}`);
+        console.log(`جاري رفع: ${relPath}`);
         // رفع الملف عبر GitHub API
         const uploadRes = await fetch(`https://api.github.com/repos/${repoData.owner.login}/${repo}/contents/${relPath}`, {
           method: "PUT",
@@ -177,31 +142,19 @@ export default async function handler(req, res) {
         });
         
         if (!uploadRes.ok) {
-          const errorData = await uploadRes.text();
-          console.error(`❌ فشل رفع الملف: ${relPath}`, errorData);
-          failedCount++;
+          console.error(`فشل رفع الملف: ${relPath}`);
         } else {
-          console.log(`✅ تم رفع: ${relPath}`);
-          uploadedCount++;
+          console.log(`تم رفع: ${relPath}`);
         }
       } catch (error) {
-        console.error(`❌ خطأ في رفع الملف ${relPath}:`, error);
-        failedCount++;
+        console.error(`خطأ في رفع الملف ${relPath}:`, error);
       }
     }
-    
-    console.log(`📊 النتيجة النهائية: تم رفع ${uploadedCount} ملف بنجاح، فشل رفع ${failedCount} ملف`);
 
     // تنظيف الملفات المؤقتة
     fs.rmSync(tmpDir, { recursive: true, force: true });
-    console.log(`�� تم تنظيف الملفات المؤقتة`);
 
-    res.status(200).json({ 
-      message: `تم رفع المشروع بنجاح! تم رفع ${uploadedCount} ملف`, 
-      repoUrl,
-      uploadedCount,
-      failedCount
-    });
+    res.status(200).json({ message: "تم رفع المشروع بنجاح!", repoUrl });
   });
 
   req.pipe(bb);
