@@ -25,6 +25,9 @@ export default async function handler(req, res) {
   try {
     console.log(`[env] runtime=${process.env.NEXT_RUNTIME || 'node'} netlify=${process.env.NETLIFY ? 'true' : 'false'} node=${process.version} tmp=${os.tmpdir()}`);
   } catch {}
+  try {
+    console.log(`[env] runtime=${process.env.NEXT_RUNTIME || 'node'} netlify=${process.env.NETLIFY ? 'true' : 'false'} node=${process.version} tmp=${os.tmpdir()}`);
+  } catch {}
   // معلومات بيئية للمساعدة في تتبع مشاكل التشغيل (خاصة Netlify)
   try {
     console.log(
