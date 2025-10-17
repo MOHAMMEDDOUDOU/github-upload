@@ -100,20 +100,28 @@ export default async function handler(req, res) {
       method: "POST",
       headers: {
         Authorization: `token ${token}`,
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
         "Content-Type": "application/json",
-        "User-Agent": "github-upload-system"
+        "User-Agent": "github-upload-system",
       },
       body: JSON.stringify({
         name: repo,
         private: false,
-        auto_init: false, // لا نريد إنشاء README تلقائياً
+        // يجب تهيئة المستودع لخلق الفرع الافتراضي حتى نتمكن من رفع الملفات عبر API
+        auto_init: true,
       }),
     });
     
     if (!createRepoRes.ok) {
       const errorText = await createRepoRes.text();
       console.error(`❌ فشل إنشاء المستودع:`, errorText);
-      return res.status(400).json({ message: "فشل إنشاء المستودع على GitHub" });
+      let human = "فشل إنشاء المستودع على GitHub";
+      try {
+        const parsed = JSON.parse(errorText);
+        if (parsed && parsed.message) human = `فشل إنشاء المستودع: ${parsed.message}`;
+      } catch {}
+      return res.status(400).json({ message: human });
     }
     
     const repoData = await createRepoRes.json();
@@ -167,12 +175,16 @@ export default async function handler(req, res) {
           method: "PUT",
           headers: {
             Authorization: `token ${token}`,
+            Accept: "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
             "Content-Type": "application/json",
-            "User-Agent": "github-upload-system"
+            "User-Agent": "github-upload-system",
           },
           body: JSON.stringify({
             message: `add ${relPath}`,
             content,
+            // ارفع على الفرع الافتراضي بوضوح
+            branch: repoData.default_branch || "main",
           }),
         });
         

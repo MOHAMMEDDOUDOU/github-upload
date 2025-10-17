@@ -78,6 +78,8 @@ export default async function handler(req, res) {
       method: "POST",
       headers: {
         Authorization: `token ${token}`,
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
         "Content-Type": "application/json",
         "User-Agent": "github-upload-system"
       },
@@ -88,7 +90,13 @@ export default async function handler(req, res) {
       }),
     });
     if (!createRepoRes.ok) {
-      return res.status(400).json({ message: "فشل إنشاء المستودع على GitHub" });
+      const errorText = await createRepoRes.text();
+      let human = "فشل إنشاء المستودع على GitHub";
+      try {
+        const parsed = JSON.parse(errorText);
+        if (parsed && parsed.message) human = `فشل إنشاء المستودع: ${parsed.message}`;
+      } catch {}
+      return res.status(400).json({ message: human });
     }
     const repoData = await createRepoRes.json();
     const repoUrl = repoData.html_url;
@@ -132,17 +140,21 @@ export default async function handler(req, res) {
           method: "PUT",
           headers: {
             Authorization: `token ${token}`,
+            Accept: "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
             "Content-Type": "application/json",
             "User-Agent": "github-upload-system"
           },
           body: JSON.stringify({
             message: `add ${relPath}`,
             content,
+            branch: repoData.default_branch || "main",
           }),
         });
         
         if (!uploadRes.ok) {
-          console.error(`فشل رفع الملف: ${relPath}`);
+          const errorText = await uploadRes.text();
+          console.error(`فشل رفع الملف: ${relPath}`, errorText);
         } else {
           console.log(`تم رفع: ${relPath}`);
         }
