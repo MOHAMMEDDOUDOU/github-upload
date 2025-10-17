@@ -78,6 +78,8 @@ export default async function handler(req, res) {
       method: "POST",
       headers: {
         Authorization: `token ${token}`,
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
         "Content-Type": "application/json",
         "User-Agent": "github-upload-system"
       },
@@ -88,10 +90,19 @@ export default async function handler(req, res) {
       }),
     });
     if (!createRepoRes.ok) {
-      return res.status(400).json({ message: "فشل إنشاء المستودع على GitHub" });
+      const errorText = await createRepoRes.text();
+      let human = "فشل إنشاء المستودع على GitHub";
+      try {
+        const parsed = JSON.parse(errorText);
+        if (parsed && parsed.message) human = `فشل إنشاء المستودع: ${parsed.message}`;
+      } catch {}
+      return res.status(400).json({ message: human });
     }
     const repoData = await createRepoRes.json();
     const repoUrl = repoData.html_url;
+    const ownerLogin = repoData?.owner?.login;
+    const repoName = repoData?.name;
+    const defaultBranch = repoData?.default_branch || "main";
 
     // رفع الملفات إلى المستودع (ملف ملف عبر GitHub API)
     const walk = (dir) => {
@@ -127,22 +138,47 @@ export default async function handler(req, res) {
       
       try {
         console.log(`جاري رفع: ${relPath}`);
-        // رفع الملف عبر GitHub API
-        const uploadRes = await fetch(`https://api.github.com/repos/${repoData.owner.login}/${repo}/contents/${relPath}`, {
-          method: "PUT",
-          headers: {
-            Authorization: `token ${token}`,
-            "Content-Type": "application/json",
-            "User-Agent": "github-upload-system"
-          },
-          body: JSON.stringify({
-            message: `add ${relPath}`,
-            content,
-          }),
-        });
-        
+        const contentUrl = encodeURI(`https://api.github.com/repos/${ownerLogin}/${repoName}/contents/${relPath}`);
+        const jsonHeaders = {
+          Authorization: `token ${token}`,
+          Accept: "application/vnd.github+json",
+          "X-GitHub-Api-Version": "2022-11-28",
+          "Content-Type": "application/json",
+          "User-Agent": "github-upload-system",
+        };
+        const basePayload = { message: `add ${relPath}`, content, branch: defaultBranch };
+        let uploadRes = await fetch(contentUrl, { method: "PUT", headers: jsonHeaders, body: JSON.stringify(basePayload) });
         if (!uploadRes.ok) {
-          console.error(`فشل رفع الملف: ${relPath}`);
+          if (uploadRes.status === 409 || uploadRes.status === 422) {
+            try {
+              const getRes = await fetch(`${contentUrl}?ref=${encodeURIComponent(defaultBranch)}`, { method: "GET", headers: jsonHeaders });
+              if (getRes.ok) {
+                const fileMeta = await getRes.json();
+                const sha = fileMeta?.sha;
+                if (sha) {
+                  const updateRes = await fetch(contentUrl, {
+                    method: "PUT",
+                    headers: jsonHeaders,
+                    body: JSON.stringify({ message: `update ${relPath}`, content, branch: defaultBranch, sha }),
+                  });
+                  if (updateRes.ok) {
+                    console.log(`تم تحديث: ${relPath}`);
+                    continue;
+                  } else {
+                    const updErr = await updateRes.text();
+                    console.error(`فشل تحديث الملف: ${relPath}`, updErr);
+                  }
+                }
+              } else {
+                const metaErr = await getRes.text();
+                console.error(`فشل جلب بيانات الملف قبل التحديث: ${relPath}`, metaErr);
+              }
+            } catch (e) {
+              console.error(`استثناء أثناء محاولة التحديث: ${relPath}`, e);
+            }
+          }
+          const errorText = await uploadRes.text();
+          console.error(`فشل رفع الملف: ${relPath}`, errorText);
         } else {
           console.log(`تم رفع: ${relPath}`);
         }
