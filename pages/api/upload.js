@@ -16,6 +16,15 @@ export default async function handler(req, res) {
 
   const bb = Busboy({ headers: req.headers });
   let repo = "", token = "", zipBuffer = null;
+  try {
+    console.log(`[env] runtime=${process.env.NEXT_RUNTIME || 'node'} netlify=${process.env.NETLIFY ? 'true' : 'false'} node=${process.version} tmp=${os.tmpdir()}`);
+  } catch {}
+  try {
+    console.log(`[env] runtime=${process.env.NEXT_RUNTIME || 'node'} netlify=${process.env.NETLIFY ? 'true' : 'false'} node=${process.version} tmp=${os.tmpdir()}`);
+  } catch {}
+  try {
+    console.log(`[env] runtime=${process.env.NEXT_RUNTIME || 'node'} netlify=${process.env.NETLIFY ? 'true' : 'false'} node=${process.version} tmp=${os.tmpdir()}`);
+  } catch {}
   // معلومات بيئية للمساعدة في تتبع مشاكل التشغيل (خاصة Netlify)
   try {
     console.log(
@@ -156,103 +165,127 @@ export default async function handler(req, res) {
     console.log(`📁 المجلد الجذر: ${projectDir}`);
     console.log(`📋 قائمة الملفات:`, files.map(f => path.relative(projectDir, f)));
 
+    // بدلاً من رفع كل ملف على حدة (والذي قد يسبب مهلة على Netlify)،
+    // سننشئ commit واحد باستخدام Git Data API (blobs + tree + commit + ref)
     let uploadedCount = 0;
     let failedCount = 0;
+    try {
+      const apiBase = "https://api.github.com";
+      const commonHeaders = {
+        Authorization: `token ${token}`,
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "Content-Type": "application/json",
+        "User-Agent": "github-upload-system",
+      };
 
-    for (const filePath of files) {
-      const content = fs.readFileSync(filePath, { encoding: "base64" });
-      const relPath = path.relative(projectDir, filePath).replace(/\\/g, "/");
-      
-      // تجاهل الملفات المخفية والمجلدات
-      if (relPath.startsWith('.') || relPath.includes('/.')) {
-        console.log(`🚫 تجاهل الملف المخفي: ${relPath}`);
-        continue;
+      // 1) آخر ref والـ commit وtree الأساسية
+      const refRes = await fetch(`${apiBase}/repos/${ownerLogin}/${repoName}/git/refs/heads/${defaultBranch}`, { headers: commonHeaders, timeout: 20000 });
+      if (!refRes.ok) {
+        const t = await refRes.text();
+        throw new Error(`فشل جلب المرجع: ${refRes.status} ${t}`);
       }
-      
-      // تجاهل الملفات الكبيرة جداً (أكبر من 100MB)
-      if (content.length > 100 * 1024 * 1024) {
-        console.log(`🚫 تجاهل الملف الكبير: ${relPath}`);
-        continue;
+      const refJson = await refRes.json();
+      const baseCommitSha = refJson?.object?.sha;
+      const commitRes = await fetch(`${apiBase}/repos/${ownerLogin}/${repoName}/git/commits/${baseCommitSha}`, { headers: commonHeaders, timeout: 20000 });
+      if (!commitRes.ok) {
+        const t = await commitRes.text();
+        throw new Error(`فشل جلب الـ commit: ${commitRes.status} ${t}`);
       }
-      
-      try {
-        console.log(`⬆️ جاري رفع: ${relPath}`);
-        // رفع الملف عبر GitHub API
-        const contentUrl = encodeURI(`https://api.github.com/repos/${ownerLogin}/${repoName}/contents/${relPath}`);
-        const jsonHeaders = {
-          Authorization: `token ${token}`,
-          Accept: "application/vnd.github+json",
-          "X-GitHub-Api-Version": "2022-11-28",
-          "Content-Type": "application/json",
-          "User-Agent": "github-upload-system",
-        };
-        const basePayload = {
-          message: `add ${relPath}`,
-          content,
-          // ارفع على الفرع الافتراضي بوضوح
-          branch: defaultBranch,
-        };
-        let uploadRes = await fetch(contentUrl, {
-          method: "PUT",
-          headers: jsonHeaders,
-          body: JSON.stringify(basePayload),
+      const commitJson = await commitRes.json();
+      const baseTreeSha = commitJson?.tree?.sha;
+
+      // 2) حضّر الملفات المرئية ضمن الحجم
+      const fileEntries = [];
+      for (const filePath of files) {
+        const relPath = path.relative(projectDir, filePath).replace(/\\/g, "/");
+        if (relPath.startsWith('.') || relPath.includes('/.')) continue;
+        const raw = fs.readFileSync(filePath);
+        if (raw.length > 100 * 1024 * 1024) { // 100MB
+          console.log(`🚫 تجاهل الملف الكبير: ${relPath}`);
+          continue;
+        }
+        const b64 = raw.toString('base64');
+        fileEntries.push({ relPath, b64 });
+      }
+
+      // 3) إنشاء blobs بتوازي محدود
+      const limit = async (arr, n, worker) => {
+        const results = new Array(arr.length);
+        let idx = 0;
+        const runners = new Array(Math.min(n, arr.length)).fill(0).map(async () => {
+          while (true) {
+            const i = idx++;
+            if (i >= arr.length) return;
+            results[i] = await worker(arr[i], i);
+          }
+        });
+        await Promise.all(runners);
+        return results;
+      };
+
+      const blobs = await limit(fileEntries, 8, async (f) => {
+        const resp = await fetch(`${apiBase}/repos/${ownerLogin}/${repoName}/git/blobs`, {
+          method: 'POST',
+          headers: commonHeaders,
+          body: JSON.stringify({ content: f.b64, encoding: 'base64' }),
           timeout: 20000,
         });
-        
-        if (!uploadRes.ok) {
-          // إذا كان الملف موجودًا مسبقًا (مثلاً README عند التهيئة)، حاول التحديث بدلاً من الإنشاء
-          if (uploadRes.status === 409 || uploadRes.status === 422) {
-            try {
-              const getRes = await fetch(`${contentUrl}?ref=${encodeURIComponent(defaultBranch)}`, {
-                method: "GET",
-                headers: jsonHeaders,
-                timeout: 20000,
-              });
-              if (getRes.ok) {
-                const fileMeta = await getRes.json();
-                const sha = fileMeta?.sha;
-                if (sha) {
-                  const updateRes = await fetch(contentUrl, {
-                    method: "PUT",
-                    headers: jsonHeaders,
-                    body: JSON.stringify({
-                      message: `update ${relPath}`,
-                      content,
-                      branch: defaultBranch,
-                      sha,
-                    }),
-                    timeout: 20000,
-                  });
-                  if (updateRes.ok) {
-                    console.log(`♻️ تم تحديث: ${relPath}`);
-                    uploadedCount++;
-                    continue;
-                  } else {
-                    const updErr = await updateRes.text();
-                    console.error(`❌ فشل تحديث الملف: ${relPath}`, updErr);
-                  }
-                }
-              } else {
-                const metaErr = await getRes.text();
-                console.error(`❌ فشل جلب بيانات الملف قبل التحديث: ${relPath}`, metaErr);
-              }
-            } catch (e) {
-              console.error(`❌ استثناء أثناء محاولة التحديث: ${relPath}`, e);
-            }
-          }
-
-          // إذا وصلنا هنا فما زال الفشل قائمًا
-          const errorData = await uploadRes.text();
-          console.error(`❌ فشل رفع الملف: ${relPath}`, errorData);
-          failedCount++;
-        } else {
-          console.log(`✅ تم رفع: ${relPath}`);
-          uploadedCount++;
+        if (!resp.ok) {
+          const t = await resp.text();
+          throw new Error(`فشل إنشاء blob لـ ${f.relPath}: ${resp.status} ${t}`);
         }
-      } catch (error) {
-        console.error(`❌ خطأ في رفع الملف ${relPath}:`, error);
-        failedCount++;
+        const j = await resp.json();
+        return { path: f.relPath, sha: j.sha };
+      });
+
+      // 4) إنشاء tree جديد من blobs
+      const treeRes = await fetch(`${apiBase}/repos/${ownerLogin}/${repoName}/git/trees`, {
+        method: 'POST',
+        headers: commonHeaders,
+        body: JSON.stringify({
+          base_tree: baseTreeSha,
+          tree: blobs.map((b) => ({ path: b.path, mode: '100644', type: 'blob', sha: b.sha })),
+        }),
+        timeout: 20000,
+      });
+      if (!treeRes.ok) {
+        const t = await treeRes.text();
+        throw new Error(`فشل إنشاء الشجرة: ${treeRes.status} ${t}`);
       }
+      const treeJson = await treeRes.json();
+
+      // 5) إنشاء commit جديد
+      const commitRes2 = await fetch(`${apiBase}/repos/${ownerLogin}/${repoName}/git/commits`, {
+        method: 'POST',
+        headers: commonHeaders,
+        body: JSON.stringify({ message: 'initial import', tree: treeJson.sha, parents: [baseCommitSha] }),
+        timeout: 20000,
+      });
+      if (!commitRes2.ok) {
+        const t = await commitRes2.text();
+        throw new Error(`فشل إنشاء الـ commit: ${commitRes2.status} ${t}`);
+      }
+      const commitJson2 = await commitRes2.json();
+
+      // 6) تحديث المرجع إلى الـ commit الجديد
+      const refUpdate = await fetch(`${apiBase}/repos/${ownerLogin}/${repoName}/git/refs/heads/${defaultBranch}`, {
+        method: 'PATCH',
+        headers: commonHeaders,
+        body: JSON.stringify({ sha: commitJson2.sha, force: true }),
+        timeout: 20000,
+      });
+      if (!refUpdate.ok) {
+        const t = await refUpdate.text();
+        throw new Error(`فشل تحديث المرجع: ${refUpdate.status} ${t}`);
+      }
+
+      uploadedCount = fileEntries.length;
+      failedCount = 0;
+      console.log(`✅ تم الرفع بإنشاء commit واحد: ${uploadedCount} ملف`);
+    } catch (e) {
+      console.error('❌ فشل الرفع عبر Git Data API:', e?.stack || e);
+      return res.status(500).json({ message: 'فشل رفع الملفات عبر Git API. راجع السجلات.' });
     }
     
     console.log(`📊 النتيجة النهائية: تم رفع ${uploadedCount} ملف بنجاح، فشل رفع ${failedCount} ملف`);
