@@ -16,6 +16,12 @@ export default async function handler(req, res) {
 
   const bb = Busboy({ headers: req.headers });
   let repo = "", token = "", zipBuffer = null;
+  // معلومات بيئية للمساعدة في تتبع مشاكل التشغيل (خاصة Netlify)
+  try {
+    console.log(
+      `[env] runtime=${process.env.NEXT_RUNTIME || 'node'} netlify=${process.env.NETLIFY ? 'true' : 'false'} node=${process.version} tmp=${os.tmpdir()}`
+    );
+  } catch {}
 
   bb.on("field", (name, val) => {
     if (name === "repo") repo = val;
@@ -27,71 +33,65 @@ export default async function handler(req, res) {
     file.on("end", () => {
       zipBuffer = Buffer.concat(buffers);
     });
+    file.on("error", (err) => {
+      console.error("❌ خطأ أثناء قراءة الملف المرفوع:", err?.stack || err);
+    });
+  });
+
+  bb.on("error", (err) => {
+    console.error("❌ خطأ Busboy:", err?.stack || err);
   });
 
   bb.on("finish", async () => {
-    if (!repo || !token || !zipBuffer) {
-      return res.status(400).json({ message: "بيانات ناقصة" });
-    }
+    let tmpDir;
+    try {
+      if (!repo || !token || !zipBuffer) {
+        return res.status(400).json({ message: "بيانات ناقصة" });
+      }
 
     console.log(`=== بدء معالجة الملف المضغوط للمستودع: ${repo} ===`);
 
     // فك ضغط الملف في مجلد مؤقت
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "upload-"));
-    console.log(`�� تم إنشاء المجلد المؤقت: ${tmpDir}`);
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "upload-"));
+    console.log(`📁 تم إنشاء المجلد المؤقت: ${tmpDir}`);
+
+    try {
+      const zip = new AdmZip(zipBuffer);
+      zip.extractAllTo(tmpDir, true);
+      console.log(`📦 تم استخراج الملف المضغوط`);
+    } catch (e) {
+      console.error("❌ فشل استخراج الملف المضغوط:", e?.stack || e);
+      return res.status(400).json({ message: "فشل استخراج الملف المضغوط" });
+    }
     
-    const zip = new AdmZip(zipBuffer);
-    zip.extractAllTo(tmpDir, true);
-    console.log(`📦 تم استخراج الملف المضغوط`);
-    
-    // التحقق من وجود مجلد واحد فقط في الأعلى (مجلد المشروع)
+    // تحديد المجلد الجذري الفعلي داخل الملف المضغوط مع تسطيح سلاسل المجلد الواحد
     const topLevelItems = fs.readdirSync(tmpDir);
     console.log(`📋 المحتويات في المجلد المؤقت:`, topLevelItems);
-    
+
     let projectDir = tmpDir;
-    
-    // إذا كان هناك مجلد واحد فقط في الأعلى، انسخ محتوياته إلى المجلد الجذر
-    if (topLevelItems.length === 1 && fs.statSync(path.join(tmpDir, topLevelItems[0])).isDirectory()) {
-      const subDir = path.join(tmpDir, topLevelItems[0]);
-      console.log(`🔍 تم اكتشاف مجلد المشروع: ${topLevelItems[0]}`);
-      console.log(`📂 مسار المجلد الفرعي: ${subDir}`);
-      
-      // عرض محتويات المجلد الفرعي
-      const subDirContents = fs.readdirSync(subDir);
-      console.log(`📋 محتويات المجلد الفرعي:`, subDirContents);
-      
-      // نسخ جميع الملفات من المجلد الفرعي إلى المجلد الجذر
-      const copyRecursive = (src, dest) => {
-        const items = fs.readdirSync(src);
-        console.log(`📄 نسخ ${items.length} عنصر من ${src} إلى ${dest}`);
-        
-        items.forEach(item => {
-          const srcPath = path.join(src, item);
-          const destPath = path.join(dest, item);
-          const stat = fs.statSync(srcPath);
-          
-          if (stat.isDirectory()) {
-            console.log(`📁 إنشاء مجلد: ${destPath}`);
-            fs.mkdirSync(destPath, { recursive: true });
-            copyRecursive(srcPath, destPath);
-          } else {
-            console.log(`📄 نسخ ملف: ${srcPath} → ${destPath}`);
-            fs.copyFileSync(srcPath, destPath);
-          }
-        });
-      };
-      
-      copyRecursive(subDir, tmpDir);
-      
-      // حذف المجلد الفرعي الأصلي
-      console.log(`🗑️ حذف المجلد الفرعي الأصلي: ${subDir}`);
-      fs.rmSync(subDir, { recursive: true, force: true });
-      
-      // التحقق من المحتويات بعد النسخ
-      const finalContents = fs.readdirSync(tmpDir);
-      console.log(`✅ المحتويات النهائية في المجلد الجذر:`, finalContents);
-    } else {
-      console.log(`📂 استخدام المجلد الجذر مباشرة`);
+    const isJunk = (name) => name === '__MACOSX' || name === '.DS_Store' || name.toLowerCase() === 'thumbs.db';
+    const isHidden = (name) => name.startsWith('.');
+    const isIgnorable = (name) => isHidden(name) || isJunk(name);
+    try {
+      let currentDir = tmpDir;
+      while (true) {
+        const entries = fs.readdirSync(currentDir);
+        const visible = entries.filter((n) => !isIgnorable(n));
+        const dirs = visible.filter((n) => { try { return fs.statSync(path.join(currentDir, n)).isDirectory(); } catch { return false; } });
+        const files = visible.filter((n) => { try { return !fs.statSync(path.join(currentDir, n)).isDirectory(); } catch { return false; } });
+        console.log(`🔎 في ${currentDir} — مجلدات: ${dirs.length}, ملفات: ${files.length}`);
+        if (dirs.length === 1 && files.length === 0) {
+          console.log(`➡️ نزول داخل المجلد الوحيد: ${dirs[0]}`);
+          currentDir = path.join(currentDir, dirs[0]);
+          continue;
+        }
+        break;
+      }
+      projectDir = currentDir;
+      console.log(`📁 مجلد المشروع المعتمد: ${projectDir}`);
+    } catch (e) {
+      console.error('⚠️ فشل تحليل بنية المجلد داخل ZIP:', e?.stack || e);
+      projectDir = tmpDir;
     }
 
     // إنشاء مستودع جديد على GitHub
@@ -111,7 +111,10 @@ export default async function handler(req, res) {
         // يجب تهيئة المستودع لخلق الفرع الافتراضي حتى نتمكن من رفع الملفات عبر API
         auto_init: true,
       }),
+      // مهلة لتفادي تعليق الطلب في بعض بيئات السيرفر
+      timeout: 20000,
     });
+    console.log(`ℹ️ إنشاء المستودع - الحالة: ${createRepoRes.status}, rate-limit-remaining: ${createRepoRes.headers.get('x-ratelimit-remaining')}`);
     
     if (!createRepoRes.ok) {
       const errorText = await createRepoRes.text();
@@ -193,6 +196,7 @@ export default async function handler(req, res) {
           method: "PUT",
           headers: jsonHeaders,
           body: JSON.stringify(basePayload),
+          timeout: 20000,
         });
         
         if (!uploadRes.ok) {
@@ -202,6 +206,7 @@ export default async function handler(req, res) {
               const getRes = await fetch(`${contentUrl}?ref=${encodeURIComponent(defaultBranch)}`, {
                 method: "GET",
                 headers: jsonHeaders,
+                timeout: 20000,
               });
               if (getRes.ok) {
                 const fileMeta = await getRes.json();
@@ -216,6 +221,7 @@ export default async function handler(req, res) {
                       branch: defaultBranch,
                       sha,
                     }),
+                    timeout: 20000,
                   });
                   if (updateRes.ok) {
                     console.log(`♻️ تم تحديث: ${relPath}`);
@@ -252,8 +258,12 @@ export default async function handler(req, res) {
     console.log(`📊 النتيجة النهائية: تم رفع ${uploadedCount} ملف بنجاح، فشل رفع ${failedCount} ملف`);
 
     // تنظيف الملفات المؤقتة
-    fs.rmSync(tmpDir, { recursive: true, force: true });
-    console.log(`�� تم تنظيف الملفات المؤقتة`);
+    try {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+      console.log(`🧹 تم تنظيف الملفات المؤقتة`);
+    } catch (e) {
+      console.error("⚠️ تعذر تنظيف الملفات المؤقتة:", e?.stack || e);
+    }
 
     res.status(200).json({ 
       message: `تم رفع المشروع بنجاح! تم رفع ${uploadedCount} ملف`, 
@@ -261,6 +271,10 @@ export default async function handler(req, res) {
       uploadedCount,
       failedCount
     });
+    } catch (fatal) {
+      console.error("💥 خطأ غير متوقع في معالج الرفع:", fatal?.stack || fatal);
+      return res.status(500).json({ message: "حدث خطأ غير متوقع أثناء المعالجة" });
+    }
   });
 
   req.pipe(bb);
